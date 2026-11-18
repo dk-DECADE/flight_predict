@@ -1,0 +1,455 @@
+---
+title: "Flight Arrival Delay Prediction"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+params:
+  model: "both"
+  rf_trials: 20
+  data_dir: ""
+  output_dir: ""
+---
+
+This report predicts whether a flight will arrive at least 30 minutes late. It compares a random forest and XGBoost on the same eight scheduled flight features and the same held-out records.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+flight_root <- dirname(dirname(normalizePath(knitr::current_input(dir = TRUE), winslash = "/", mustWork = TRUE)))
+flight_data_dir <- file.path(flight_root, "\u6e05\u6d17\u5b8c\u6210\u7684\u6570\u636e")
+flight_category_features <- c("OP_UNIQUE_CARRIER", "ORIGIN", "DEST")
+flight_numeric_features <- c("month", "day_of_week", "scheduled_departure_hour", "CRS_ELAPSED_TIME", "DISTANCE")
+flight_features <- c(flight_category_features, flight_numeric_features)
+flight_target <- "major_delay_30"
+flight_threads <- 8L
+
+chosen_models <- switch(params$model,
+                        both = c("random_forest", "xgboost"),
+                        random_forest = "random_forest",
+                        xgboost = "xgboost",
+                        stop("model must be both, random_forest, or xgboost.", call. = FALSE))
+model_labels <- c(random_forest = "Random Forest", xgboost = "XGBoost")
+data_dir <- if (nzchar(params$data_dir)) params$data_dir else flight_data_dir
+output_dir <- if (nzchar(params$output_dir)) params$output_dir else file.path(flight_root, "results", "r")
+
+report_image <- function(path, description, width) {
+  sprintf('<img src="%s" alt="%s" style="width:%d%%" />', knitr::image_uri(path), description, width)
+}
+```
+
+## Data and time split
+
+The inputs are carrier, origin airport, destination airport, month, day of week, scheduled departure hour, scheduled elapsed time, and distance. Each candidate is trained on January–June and scored on July–August. The selected model is refitted on January–September and evaluated on October–December. Each training period defines its own one-hot encoding.
+
+```{r data-and-encoding}
+require_flight_packages <- function(packages) {
+  missing <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing)) {
+    quoted <- paste(sprintf('"%s"', missing), collapse = ", ")
+    stop(sprintf("Run install.packages(c(%s)) in the RStudio Console.", quoted), call. = FALSE)
+  }
+}
+
+read_flight_splits <- function(data_dir) {
+  if (.Platform$OS.type == "windows" && !l10n_info()[["UTF-8"]]) {
+    previous_locale <- Sys.getlocale("LC_CTYPE")
+    on.exit(Sys.setlocale("LC_CTYPE", previous_locale), add = TRUE)
+    Sys.setlocale("LC_CTYPE", ".UTF-8")
+  }
+  files <- sort(list.files(data_dir, pattern = "_cleaned\\.csv$", full.names = TRUE))
+  if (!length(files)) stop("No *_cleaned.csv files found in: ", data_dir, call. = FALSE)
+  columns <- c(flight_features, "FL_DATE", flight_target, "ARR_DELAY", "CANCELLED", "DIVERTED")
+  months <- lapply(files, function(path) {
+    flights <- data.table::fread(file = path, select = columns, colClasses = c(FL_DATE = "character"),
+                                 encoding = "UTF-8", nThread = flight_threads)
+    missing <- setdiff(columns, names(flights))
+    if (length(missing)) stop(basename(path), " is missing: ", paste(missing, collapse = ", "), call. = FALSE)
+    flights$record_id <- paste0(basename(path), ":", seq_len(nrow(flights)) + 1L)
+    flights
+  })
+  flights <- as.data.frame(data.table::rbindlist(months, use.names = TRUE))
+  dates <- as.Date(flights$FL_DATE, format = "%Y-%m-%d")
+  if (anyNA(flights) || anyNA(dates) || any(format(dates, "%Y-%m-%d") != flights$FL_DATE) ||
+      !all(vapply(flights[flight_numeric_features], function(x) is.numeric(x) && all(is.finite(x)), logical(1)))) {
+    stop("Flight data contain missing or invalid values.", call. = FALSE)
+  }
+  month <- as.integer(format(dates, "%m"))
+  if (length(unique(format(dates, "%Y"))) != 1L || !setequal(month, 1:12)) {
+    stop("The cleaned files must cover January through December of one year.", call. = FALSE)
+  }
+  if (any(flights$month != month) || any(flights$day_of_week != as.integer(format(dates, "%u")) - 1L)) {
+    stop("The month or day_of_week disagrees with FL_DATE.", call. = FALSE)
+  }
+  if (any(!is.finite(flights$ARR_DELAY)) || any(flights[[flight_target]] != as.integer(flights$ARR_DELAY >= 30)) ||
+      any(flights$CANCELLED != 0L) || any(flights$DIVERTED != 0L)) {
+    stop("Check the delay label and exclude cancelled or diverted flights.", call. = FALSE)
+  }
+  flights <- flights[c("record_id", "FL_DATE", flight_features, flight_target)]
+  splits <- list(search_train = flights[month <= 6L, ], validation = flights[month %in% 7:8, ],
+                 final_train = flights[month <= 9L, ], test = flights[month >= 10L, ])
+  for (name in names(splits)) {
+    if (!setequal(splits[[name]][[flight_target]], 0:1)) {
+      stop(name, " must contain both delayed and non-delayed flights.", call. = FALSE)
+    }
+  }
+  splits
+}
+
+fit_flight_encoder <- function(flights) {
+  lapply(flights[flight_category_features], function(values) sort(unique(values), method = "radix"))
+}
+
+encoded_source_features <- function(encoder) {
+  c(rep(names(encoder), lengths(encoder)), flight_numeric_features)
+}
+
+encode_flight_features <- function(flights, encoder, representation = "C") {
+  n <- nrow(flights)
+  offsets <- c(0L, cumsum(lengths(encoder)))
+  categorical_columns <- Map(function(feature, offset) match(flights[[feature]], encoder[[feature]]) + offset,
+                             names(encoder), head(offsets, -1L))
+  numeric_columns <- tail(offsets, 1L) + seq_along(flight_numeric_features)
+  column_index <- c(unlist(categorical_columns, use.names = FALSE), rep(numeric_columns, each = n))
+  row_index <- rep(seq_len(n), length(encoder) + length(numeric_columns))
+  values <- c(rep(1, n * length(encoder)), unlist(flights[flight_numeric_features], use.names = FALSE))
+  known <- !is.na(column_index)
+  Matrix::sparseMatrix(i = row_index[known], j = column_index[known], x = values[known],
+                       dims = c(n, max(numeric_columns)), repr = representation,
+                       dimnames = list(NULL, paste0("f", seq_len(max(numeric_columns)) - 1L)))
+}
+```
+
+## Metrics
+
+Average Precision (AP) summarizes the risk ranking. Brier score is the mean squared error of the predicted probabilities. For the highest-risk 10% of flights, precision is the fraction that actually arrived late, and recall is the fraction of all delayed flights captured by the alerts.
+
+```{r evaluation-functions}
+flight_precision_recall <- function(actual, probability) {
+  ranked <- order(probability, decreasing = TRUE, method = "radix")
+  endpoints <- c(which(diff(probability[ranked]) != 0), length(actual))
+  true_positives <- cumsum(actual[ranked])[endpoints]
+  list(precision = c(1, true_positives / endpoints), recall = c(0, true_positives / sum(actual)))
+}
+
+evaluate_flight_predictions <- function(actual, probability) {
+  curve <- flight_precision_recall(actual, probability)
+  count <- ceiling(length(actual) * 0.10)
+  set.seed(42L)
+  tie_order <- sample.int(length(actual))
+  selected <- head(order(-probability, tie_order, method = "radix"), count)
+  hits <- sum(actual[selected])
+  list(metrics = list(PR_AUC_AP = sum(diff(curve$recall) * curve$precision[-1L]),
+                      Brier = mean((probability - actual)^2), Top10_count = count, Top10_hits = hits,
+                      Precision_Top10 = hits / count, Recall_Top10 = hits / sum(actual)),
+       selected = selected, curve = curve)
+}
+
+flight_metric_line <- function(metrics) {
+  sprintf("AP=%.6f Brier=%.6f | Top10%% precision=%.2f%% recall=%.2f%% | %d/%d hits",
+          metrics$PR_AUC_AP, metrics$Brier, 100 * metrics$Precision_Top10, 100 * metrics$Recall_Top10,
+          metrics$Top10_hits, metrics$Top10_count)
+}
+
+flight_logger <- function(output_dir) {
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  log_path <- file.path(output_dir, "training_log.txt")
+  writeLines(character(), log_path)
+  function(message) {
+    cat(message, "\n", sep = "")
+    cat(message, "\n", sep = "", file = log_path, append = TRUE)
+    flush.console()
+  }
+}
+
+write_flight_splits <- function(splits, output_dir, log) {
+  log("Jan-Jun: candidate training | Jul-Aug: validation | Jan-Sep: final refit | Oct-Dec: test")
+  report <- lapply(names(splits), function(name) {
+    part <- splits[[name]]
+    rate <- mean(part[[flight_target]])
+    dates <- range(part$FL_DATE)
+    log(sprintf("%s: %d flights, %.2f%% delayed, %s to %s", name, nrow(part), 100 * rate, dates[1L], dates[2L]))
+    data.frame(split = name, n = nrow(part), delay_rate = rate, first_date = dates[1L], last_date = dates[2L])
+  })
+  data.table::fwrite(data.table::rbindlist(report), file.path(output_dir, "data_split.csv"))
+  counts <- table(splits$final_train$month)
+  data.table::fwrite(data.frame(month = as.integer(names(counts)), n = as.integer(counts)),
+                     file.path(output_dir, "training_month_counts.csv"))
+}
+
+write_flight_evaluation <- function(test, probability, output_dir, model_name, log) {
+  actual <- test[[flight_target]]
+  evaluation <- evaluate_flight_predictions(actual, probability)
+  summary <- c(list(split = "test", n = nrow(test), actual_delays = sum(actual),
+                    delay_rate = mean(actual), mean_predicted_probability = mean(probability)), evaluation$metrics)
+  data.table::fwrite(as.data.frame(summary), file.path(output_dir, "evaluation.csv"))
+  test$predicted_delay_probability <- probability
+  test$in_top10_percent <- 0L
+  test$in_top10_percent[evaluation$selected] <- 1L
+  data.table::fwrite(test, file.path(output_dir, "test_predictions.csv.gz"), compress = "gzip",
+                     nThread = flight_threads)
+
+  png(file.path(output_dir, "precision_recall_curve.png"), width = 1050, height = 750, res = 150)
+  plot(evaluation$curve$recall, evaluation$curve$precision, type = "S", col = "steelblue", lwd = 2,
+       xlim = c(0, 1), ylim = c(0, 1), xlab = "Recall", ylab = "Precision",
+       main = paste(model_name, "- Oct-Dec PR curve"))
+  abline(h = mean(actual), col = "gray50", lty = 2)
+  legend("topright", c(model_name, "Observed delay rate"), col = c("steelblue", "gray50"), lty = c(1, 2), bty = "n")
+  dev.off()
+
+  bins <- cut(probability, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)
+  calibration <- aggregate(cbind(predicted = probability, observed = actual), list(bin = bins), mean)
+  png(file.path(output_dir, "calibration_curve.png"), width = 900, height = 900, res = 150)
+  plot(calibration$predicted, calibration$observed, type = "b", pch = 19, col = "steelblue", lwd = 2,
+       xlim = c(0, 1), ylim = c(0, 1), xlab = "Mean predicted risk", ylab = "Observed delay rate",
+       main = paste(model_name, "- Oct-Dec probability check"))
+  abline(0, 1, lty = 2)
+  dev.off()
+  log(paste("Final test |", flight_metric_line(evaluation$metrics)))
+}
+
+write_flight_importance <- function(scores, encoder, method, output_dir, log) {
+  features <- encoded_source_features(encoder)
+  stopifnot(length(features) == length(scores))
+  scores <- as.numeric(tapply(scores, factor(features, levels = flight_features), sum))
+  if (sum(scores) > 0) scores <- scores / sum(scores)
+  ranked <- order(scores, decreasing = TRUE, method = "radix")
+  report <- data.frame(feature = flight_features[ranked], importance_share = scores[ranked], method = method)
+  data.table::fwrite(report, file.path(output_dir, "feature_importance.csv"))
+  log(paste("Feature importance |", method))
+  for (row in seq_len(nrow(report))) {
+    log(sprintf("  %d. %-26s %6.2f%%", row, report$feature[row], 100 * report$importance_share[row]))
+  }
+}
+```
+
+## Random forest
+
+The default grid compares 20 combinations of tree count, maximum depth, and minimum leaf size. The report selects the highest validation AP, then the lowest Brier score on a tie.
+
+```{r random-forest-functions}
+fit_flight_forest <- function(x, actual, parameters, importance = "none") {
+  ranger::ranger(x = x, y = factor(actual, levels = 0:1), probability = TRUE, importance = importance,
+                 num.trees = parameters$n_estimators, max.depth = parameters$max_depth,
+                 min.node.size = 2L, min.bucket = parameters$min_samples_leaf,
+                 mtry = max(1L, floor(sqrt(ncol(x)))), replace = TRUE, sample.fraction = 1,
+                 oob.error = FALSE, num.threads = flight_threads, seed = 42L, verbose = FALSE)
+}
+
+run_random_forest <- function(data_dir = flight_data_dir,
+                              output_dir = file.path(flight_root, "results", "r", "random_forest"), trials = 20L) {
+  require_flight_packages(c("Matrix", "data.table", "ranger"))
+  if (!("min.bucket" %in% names(formals(ranger::ranger)))) stop("Update the ranger package to use min.bucket.")
+  if (length(trials) != 1L || !trials %in% c(20, 100)) stop("trials must be 20 or 100.", call. = FALSE)
+  log <- flight_logger(output_dir)
+  splits <- read_flight_splits(data_dir)
+  write_flight_splits(splits, output_dir, log)
+  search_encoder <- fit_flight_encoder(splits$search_train)
+  search_x <- encode_flight_features(splits$search_train, search_encoder)
+  validation_x <- encode_flight_features(splits$validation, search_encoder)
+  grid <- expand.grid(min_samples_leaf = if (trials == 20L) c(20L, 50L) else c(5L, 10L, 20L, 50L, 100L),
+                      max_depth = c(8L, 12L, 16L, 20L, 24L),
+                      n_estimators = if (trials == 20L) c(50L, 100L) else c(50L, 100L, 150L, 200L))
+  grid <- grid[c("n_estimators", "max_depth", "min_samples_leaf")]
+  results <- vector("list", nrow(grid))
+  for (run in seq_len(nrow(grid))) {
+    parameters <- grid[run, ]
+    log(sprintf("Candidate %d/%d | trees=%d depth=%d min_leaf=%d", run, nrow(grid),
+                parameters$n_estimators, parameters$max_depth, parameters$min_samples_leaf))
+    started <- proc.time()[["elapsed"]]
+    model <- fit_flight_forest(search_x, splits$search_train[[flight_target]], parameters)
+    seconds <- proc.time()[["elapsed"]] - started
+    probability <- predict(model, data = validation_x, num.threads = flight_threads)$predictions[, "1"]
+    metrics <- evaluate_flight_predictions(splits$validation[[flight_target]], probability)$metrics
+    results[[run]] <- data.frame(run = run, parameters, fit_seconds = seconds, as.data.frame(metrics))
+    data.table::fwrite(data.table::rbindlist(results), file.path(output_dir, "search_results.csv"))
+    log(sprintf("  %.2f s | validation %s", seconds, flight_metric_line(metrics)))
+  }
+  search <- data.table::rbindlist(results)
+  best <- search[head(order(-search$PR_AUC_AP, search$Brier, search$run), 1L), ]
+  data.table::fwrite(best, file.path(output_dir, "best_parameters.csv"))
+  log(sprintf("Selected candidate %d | validation AP=%.6f | refitting on Jan-Sep", best$run, best$PR_AUC_AP))
+  rm(search_x, validation_x, model)
+
+  encoder <- fit_flight_encoder(splits$final_train)
+  final_x <- encode_flight_features(splits$final_train, encoder)
+  model <- fit_flight_forest(final_x, splits$final_train[[flight_target]], best, importance = "impurity")
+  saveRDS(list(model = model, encoder = encoder, features = flight_features), file.path(output_dir, "random_forest.rds"))
+  rm(final_x)
+  test_x <- encode_flight_features(splits$test, encoder)
+  probability <- predict(model, data = test_x, num.threads = flight_threads)$predictions[, "1"]
+  write_flight_evaluation(splits$test, probability, output_dir, "Random forest", log)
+  write_flight_importance(model$variable.importance[colnames(test_x)], encoder, "impurity_decrease", output_dir, log)
+  log(paste("Completed |", normalizePath(output_dir, winslash = "/")))
+  invisible(best)
+}
+```
+
+## XGBoost
+
+Four training sequences compare two depths and two learning rates. Each runs for 300 boosting rounds and is scored at 10 checkpoints. The report selects by validation AP, then Brier score, then fewer rounds.
+
+```{r xgboost-functions}
+write_boosting_curve <- function(history, best_round, output_dir) {
+  labels <- sprintf("Depth %d, learning rate %g", history$max_depth, history$learning_rate)
+  curves <- split(history$validation_logloss, labels)
+  losses <- do.call(cbind, curves)
+  colors <- seq_along(curves) + 1L
+  png(file.path(output_dir, "boosting_learning_curve.png"), width = 1200, height = 750, res = 150)
+  matplot(seq_len(nrow(losses)), losses, type = "l", col = colors, lty = 1, lwd = 2,
+          xlab = "Boosting round", ylab = "Validation log loss", main = "July-August validation")
+  abline(v = best_round, col = "gray50", lty = 2)
+  legend("topright", c(names(curves), "Round chosen by validation AP"),
+         col = c(colors, "gray50"), lty = c(rep(1, length(curves)), 2), bty = "n")
+  dev.off()
+}
+
+run_boosting <- function(data_dir = flight_data_dir,
+                         output_dir = file.path(flight_root, "results", "r", "xgboost")) {
+  require_flight_packages(c("Matrix", "data.table", "xgboost", "jsonlite"))
+  if (utils::packageVersion("xgboost") < "3.2.0") stop("Update the xgboost package to version 3.2 or later.")
+  log <- flight_logger(output_dir)
+  splits <- read_flight_splits(data_dir)
+  write_flight_splits(splits, output_dir, log)
+  seed <- 1012508L
+  settings <- list(objective = "binary:logistic", eval_metric = "logloss", tree_method = "hist",
+                   max_bin = 64L, nthread = flight_threads)
+  rounds <- c(10L, 20L, 30L, 40L, 50L, 60L, 120L, 180L, 240L, 300L)
+  grid <- expand.grid(learning_rate = c(0.03, 0.10), max_depth = c(3L, 5L))
+  total_candidates <- length(rounds) * nrow(grid)
+
+  search_encoder <- fit_flight_encoder(splits$search_train)
+  search_x <- xgboost::xgb.QuantileDMatrix(encode_flight_features(splits$search_train, search_encoder, "R"),
+                                        label = splits$search_train[[flight_target]], max_bin = settings$max_bin,
+                                        nthread = flight_threads)
+  validation_x <- xgboost::xgb.QuantileDMatrix(encode_flight_features(splits$validation, search_encoder, "R"),
+                                             label = splits$validation[[flight_target]], ref = search_x,
+                                             max_bin = settings$max_bin, nthread = flight_threads)
+  candidates <- vector("list", total_candidates)
+  histories <- vector("list", nrow(grid))
+  run <- 0L
+  log(sprintf("Comparing %d settings across %d boosting sequences", total_candidates, nrow(grid)))
+  for (sequence in seq_len(nrow(grid))) {
+    depth <- grid$max_depth[sequence]
+    rate <- grid$learning_rate[sequence]
+    parameters <- c(settings, list(max_depth = depth, eta = rate))
+    log(sprintf("Training sequence %d | depth=%d learning_rate=%g | %d rounds", sequence, depth, rate, max(rounds)))
+    set.seed(seed)
+    started <- proc.time()[["elapsed"]]
+    model <- xgboost::xgb.train(params = parameters, data = search_x, nrounds = max(rounds),
+                               evals = list(validation = validation_x), verbose = 1L, print_every_n = 20L)
+    log(sprintf("  Sequence time: %.2f s", proc.time()[["elapsed"]] - started))
+    trace <- attr(model, "evaluation_log")
+    histories[[sequence]] <- data.frame(max_depth = depth, learning_rate = rate, boosting_round = trace$iter,
+                                        validation_logloss = trace$validation_logloss)
+    for (checkpoint in rounds) {
+      run <- run + 1L
+      probability <- predict(model, validation_x, iterationrange = c(1L, checkpoint))
+      metrics <- evaluate_flight_predictions(splits$validation[[flight_target]], probability)$metrics
+      candidates[[run]] <- data.frame(run = run, max_depth = depth, learning_rate = rate, boosting_rounds = checkpoint,
+                                      validation_logloss = trace$validation_logloss[checkpoint], as.data.frame(metrics))
+      log(sprintf("Candidate %d/%d | depth=%d learning_rate=%g rounds=%d | validation %s", run, total_candidates,
+                  depth, rate, checkpoint, flight_metric_line(metrics)))
+    }
+    data.table::fwrite(data.table::rbindlist(candidates), file.path(output_dir, "search_results.csv"))
+    data.table::fwrite(data.table::rbindlist(histories), file.path(output_dir, "round_history.csv"))
+  }
+  search <- data.table::rbindlist(candidates)
+  best <- search[head(order(-search$PR_AUC_AP, search$Brier, search$boosting_rounds, search$run), 1L), ]
+  data.table::fwrite(best, file.path(output_dir, "best_parameters.csv"))
+  log(sprintf("Selected candidate %d | depth=%d learning_rate=%g rounds=%d | validation AP=%.6f | refitting on Jan-Sep",
+              best$run, best$max_depth, best$learning_rate, best$boosting_rounds, best$PR_AUC_AP))
+  rm(search_x, validation_x, model)
+
+  encoder <- fit_flight_encoder(splits$final_train)
+  final_x <- xgboost::xgb.QuantileDMatrix(encode_flight_features(splits$final_train, encoder, "R"),
+                                       label = splits$final_train[[flight_target]], max_bin = settings$max_bin,
+                                       nthread = flight_threads)
+  parameters <- c(settings, list(max_depth = best$max_depth, eta = best$learning_rate))
+  set.seed(seed)
+  model <- xgboost::xgb.train(params = parameters, data = final_x, nrounds = best$boosting_rounds, verbose = 0L)
+  xgboost::xgb.save(model, file.path(output_dir, "xgboost.ubj"))
+  saveRDS(encoder, file.path(output_dir, "one_hot_encoder.rds"))
+  metadata <- list(features = flight_features, target = flight_target, training_rows = nrow(splits$final_train),
+                   boosting_rounds = best$boosting_rounds, parameters = parameters, seed = seed,
+                   xgboost_version = as.character(utils::packageVersion("xgboost")))
+  jsonlite::write_json(metadata, file.path(output_dir, "model_info.json"), auto_unbox = TRUE, pretty = TRUE)
+  rm(final_x)
+
+  encoded_test <- encode_flight_features(splits$test, encoder, "R")
+  test_x <- xgboost::xgb.DMatrix(encoded_test, nthread = flight_threads)
+  probability <- predict(model, test_x)
+  write_flight_evaluation(splits$test, probability, output_dir, "XGBoost", log)
+  write_boosting_curve(data.table::rbindlist(histories), best$boosting_rounds, output_dir)
+  gain <- xgboost::xgb.importance(model = model)
+  scores <- numeric(ncol(encoded_test))
+  scores[match(gain$Feature, colnames(encoded_test))] <- gain$Gain
+  write_flight_importance(scores, encoder, "total_gain", output_dir, log)
+  log(paste("Completed |", normalizePath(output_dir, winslash = "/")))
+  invisible(best)
+}
+```
+
+```{r model-training, include=FALSE}
+if ("random_forest" %in% chosen_models) {
+  run_random_forest(data_dir, file.path(output_dir, "random_forest"), trials = params$rf_trials)
+}
+if ("xgboost" %in% chosen_models) {
+  run_boosting(data_dir, file.path(output_dir, "xgboost"))
+}
+```
+
+## Held-out test results
+
+```{r test-metrics, echo=FALSE}
+scores <- lapply(chosen_models, function(model) {
+  result <- data.table::fread(file.path(output_dir, model, "evaluation.csv"))
+  data.frame(Model = model_labels[[model]], Flights = result$n, AP = result$PR_AUC_AP,
+             Brier = result$Brier, `True alerts` = result$Top10_hits,
+             `Top 10% precision` = sprintf("%.2f%%", 100 * result$Precision_Top10),
+             `Top 10% recall` = sprintf("%.2f%%", 100 * result$Recall_Top10),
+             check.names = FALSE)
+})
+knitr::kable(data.table::rbindlist(scores), digits = 6, align = c("l", rep("r", 6)))
+```
+
+## PR curves and probability checks
+
+The PR curves show the precision–recall trade-off as the alert list expands. The probability checks compare the mean predicted risk with the actual delay rate in each group.
+
+```{r test-plots, echo=FALSE, results="asis"}
+for (model in chosen_models) {
+  folder <- file.path(output_dir, model)
+  cat(report_image(file.path(folder, "precision_recall_curve.png"), paste(model_labels[[model]], "PR curve"), 48),
+      report_image(file.path(folder, "calibration_curve.png"), paste(model_labels[[model]], "probability check"), 48),
+      "\n\n")
+}
+```
+
+## Validation and feature importance
+
+The validation tables give the score at each candidate setting. Feature importance is the share of split improvement within each model, summed back to the eight original inputs.
+
+```{r model-tables, echo=FALSE, results="asis"}
+for (model in chosen_models) {
+  folder <- file.path(output_dir, model)
+  candidates <- data.table::fread(file.path(folder, "search_results.csv"))
+  importance <- data.table::fread(file.path(folder, "feature_importance.csv"))
+  best <- data.table::fread(file.path(folder, "best_parameters.csv"))
+  cat(sprintf("\n### %s\n\nSelected candidate **%d** with validation AP **%.6f**.\n\n",
+              model_labels[[model]], best$run, best$PR_AUC_AP))
+  cat("<details><summary>Validation scores for all candidates</summary>\n\n")
+  print(knitr::kable(candidates, digits = 6))
+  cat("\n</details>\n\n")
+  print(knitr::kable(data.frame(Feature = importance$feature,
+                               `Importance share` = sprintf("%.2f%%", 100 * importance$importance_share),
+                               check.names = FALSE)))
+  cat("\n\n")
+}
+```
+
+```{r boosting-learning-curve, echo=FALSE, eval="xgboost" %in% chosen_models, results="asis"}
+cat("### XGBoost validation log loss\n\n",
+    report_image(file.path(output_dir, "xgboost", "boosting_learning_curve.png"), "Validation log loss by boosting round", 80),
+    "\n\n", sep = "")
+```
