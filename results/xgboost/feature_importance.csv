@@ -1,0 +1,9 @@
+feature,importance_share,method
+scheduled_departure_hour,0.42332598158253526,total_gain
+month,0.26699038514777196,total_gain
+OP_UNIQUE_CARRIER,0.12805414413653673,total_gain
+day_of_week,0.056690884145887625,total_gain
+ORIGIN,0.053489230094797724,total_gain
+DEST,0.04436910893817926,total_gain
+CRS_ELAPSED_TIME,0.01743477525031203,total_gain
+DISTANCE,0.00964549070397941,total_gain

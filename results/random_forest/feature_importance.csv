@@ -1,0 +1,9 @@
+feature,importance_share,method
+scheduled_departure_hour,0.3933531413153452,impurity_decrease
+OP_UNIQUE_CARRIER,0.2134138639102026,impurity_decrease
+month,0.17303059997963477,impurity_decrease
+ORIGIN,0.06255251708588114,impurity_decrease
+DEST,0.058202361777113534,impurity_decrease
+day_of_week,0.0418627138053426,impurity_decrease
+CRS_ELAPSED_TIME,0.03614868976644512,impurity_decrease
+DISTANCE,0.021436112360035068,impurity_decrease

@@ -1,0 +1,2 @@
+﻿run,n_estimators,max_depth,min_samples_leaf,fit_seconds,PR_AUC_AP,Brier,Top10名单数量,Top10找到的延误数,Precision_Top10,Recall_Top10
+2,50,8,50,3.3303530999983195,0.3668974483488447,0.16614215919870276,24229,10597,0.43736844277518677,0.19723054588769565

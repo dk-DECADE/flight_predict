@@ -1,0 +1,26 @@
+{
+  "features": [
+    "OP_UNIQUE_CARRIER",
+    "ORIGIN",
+    "DEST",
+    "month",
+    "day_of_week",
+    "scheduled_departure_hour",
+    "CRS_ELAPSED_TIME",
+    "DISTANCE"
+  ],
+  "target": "major_delay_30",
+  "training_rows": 1009163,
+  "boosting_rounds": 180,
+  "parameters": {
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+    "tree_method": "hist",
+    "max_bin": 64,
+    "nthread": 8,
+    "seed": 1012508,
+    "max_depth": 5,
+    "eta": 0.1
+  },
+  "xgboost_version": "3.2.0"
+}

@@ -1,0 +1,2 @@
+﻿run,max_depth,learning_rate,boosting_rounds,validation_logloss,PR_AUC_AP,Brier,Top10名单数量,Top10找到的延误数,Precision_Top10,Recall_Top10
+38,5,0.1,180,0.49148511938853484,0.3675425460411601,0.16020940092897082,24229,10472,0.43220933591976557,0.19490405553797763
