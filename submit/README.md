@@ -35,6 +35,8 @@ Both scripts print a ranked table for the eight original features and save it as
 
 Open `submit/flight_delay_models.Rmd` in RStudio and click **Knit** to train both models and make the HTML report. Keep the cleaned data folder beside `submit/`. If a package is missing, use the RStudio Console to install it. The XGBoost code requires `xgboost` 3.2 or later.
 
+To run individual chunks, set the RStudio working directory to the project folder or its `submit/` folder, then run the **Setup** chunk first. Both methods read the options at the top of the Rmd.
+
 ```r
 packages <- c("rmarkdown", "knitr", "Matrix", "data.table", "ranger", "xgboost", "jsonlite")
 missing <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]

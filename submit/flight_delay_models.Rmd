@@ -16,7 +16,20 @@ This report predicts whether a flight will arrive at least 30 minutes late. It c
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-flight_root <- dirname(dirname(normalizePath(knitr::current_input(dir = TRUE), winslash = "/", mustWork = TRUE)))
+report_path <- knitr::current_input(dir = TRUE)
+knitting_report <- !is.null(report_path)
+if (knitting_report) {
+  report_params <- params
+} else {
+  working_dir <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+  report_dir <- if (basename(working_dir) == "submit") working_dir else file.path(working_dir, "submit")
+  report_path <- file.path(report_dir, "flight_delay_models.Rmd")
+  if (!file.exists(report_path)) {
+    stop("In RStudio, set the working directory to the project folder or its submit folder, then rerun Setup.", call. = FALSE)
+  }
+  report_params <- lapply(knitr::knit_params(readLines(report_path, encoding = "UTF-8")), `[[`, "value")
+}
+flight_root <- dirname(dirname(normalizePath(report_path, winslash = "/", mustWork = TRUE)))
 flight_data_dir <- file.path(flight_root, "\u6e05\u6d17\u5b8c\u6210\u7684\u6570\u636e")
 flight_category_features <- c("OP_UNIQUE_CARRIER", "ORIGIN", "DEST")
 flight_numeric_features <- c("month", "day_of_week", "scheduled_departure_hour", "CRS_ELAPSED_TIME", "DISTANCE")
@@ -24,16 +37,17 @@ flight_features <- c(flight_category_features, flight_numeric_features)
 flight_target <- "major_delay_30"
 flight_threads <- 8L
 
-chosen_models <- switch(params$model,
+chosen_models <- switch(report_params$model,
                         both = c("random_forest", "xgboost"),
                         random_forest = "random_forest",
                         xgboost = "xgboost",
                         stop("model must be both, random_forest, or xgboost.", call. = FALSE))
 model_labels <- c(random_forest = "Random Forest", xgboost = "XGBoost")
-data_dir <- if (nzchar(params$data_dir)) params$data_dir else flight_data_dir
-output_dir <- if (nzchar(params$output_dir)) params$output_dir else file.path(flight_root, "results", "r")
+data_dir <- if (nzchar(report_params$data_dir)) report_params$data_dir else flight_data_dir
+output_dir <- if (nzchar(report_params$output_dir)) report_params$output_dir else file.path(flight_root, "results", "r")
 
 report_image <- function(path, description, width) {
+  if (!knitting_report) return(paste(description, normalizePath(path, winslash = "/", mustWork = TRUE)))
   sprintf('<img src="%s" alt="%s" style="width:%d%%" />', knitr::image_uri(path), description, width)
 }
 ```
@@ -392,7 +406,7 @@ run_boosting <- function(data_dir = flight_data_dir,
 
 ```{r model-training, include=FALSE}
 if ("random_forest" %in% chosen_models) {
-  run_random_forest(data_dir, file.path(output_dir, "random_forest"), trials = params$rf_trials)
+  run_random_forest(data_dir, file.path(output_dir, "random_forest"), trials = report_params$rf_trials)
 }
 if ("xgboost" %in% chosen_models) {
   run_boosting(data_dir, file.path(output_dir, "xgboost"))
@@ -422,7 +436,8 @@ for (model in chosen_models) {
   folder <- file.path(output_dir, model)
   cat(report_image(file.path(folder, "precision_recall_curve.png"), paste(model_labels[[model]], "PR curve"), 48),
       report_image(file.path(folder, "calibration_curve.png"), paste(model_labels[[model]], "probability check"), 48),
-      "\n\n")
+      sep = "\n", fill = FALSE)
+  cat("\n\n")
 }
 ```
 
@@ -448,8 +463,10 @@ for (model in chosen_models) {
 }
 ```
 
-```{r boosting-learning-curve, echo=FALSE, eval="xgboost" %in% chosen_models, results="asis"}
-cat("### XGBoost validation log loss\n\n",
-    report_image(file.path(output_dir, "xgboost", "boosting_learning_curve.png"), "Validation log loss by boosting round", 80),
-    "\n\n", sep = "")
+```{r boosting-learning-curve, echo=FALSE, results="asis"}
+if ("xgboost" %in% chosen_models) {
+  cat("### XGBoost validation log loss\n\n",
+      report_image(file.path(output_dir, "xgboost", "boosting_learning_curve.png"), "Validation log loss by boosting round", 80),
+      "\n\n", sep = "")
+}
 ```
