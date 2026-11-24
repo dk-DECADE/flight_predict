@@ -1,0 +1,387 @@
+---
+title: "Random Forest Revision"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  data_dir: ""
+  output_dir: ""
+  history_lag: 1
+  trees: 30
+  threads: 8
+  scenario: "all"
+---
+
+This report predicts arrival delays of at least 30 minutes and at least 60 minutes. It also evaluates a separate 30-minute model for flights touching JFK. Run the RStudio chunks in order. The three scenarios use January–June for fitting, July–August for selection, September for calibration and alert selection, and October–December for evaluation. October–December was inspected in the earlier project, so this revision reports a reused evaluation period.
+
+## 1. Setup
+
+```{r setup}
+report_path <- knitr::current_input(dir = TRUE)
+knitting <- !is.null(report_path)
+if (knitting) {
+  options <- params
+} else {
+  report_path <- file.path("submit", "random_forest_review.Rmd")
+  if (!file.exists(report_path)) report_path <- "random_forest_review.Rmd"
+  if (!file.exists(report_path)) stop("Set the working directory to the project folder or submit.")
+  options <- lapply(knitr::knit_params(readLines(report_path, encoding = "UTF-8")), `[[`, "value")
+}
+root <- dirname(dirname(normalizePath(report_path, winslash = "/", mustWork = TRUE)))
+data_dir <- if (nzchar(options$data_dir)) options$data_dir else file.path(root, "\u6e05\u6d17\u5b8c\u6210\u7684\u6570\u636e")
+output_dir <- if (nzchar(options$output_dir)) options$output_dir else file.path(root, "results", "r", "rf_revision")
+stopifnot(options$history_lag %in% c(1L, 2L), options$trees >= 1L, options$threads >= 1L)
+library(data.table)
+for (package in c("ranger", "Matrix")) {
+  if (!requireNamespace(package, quietly = TRUE)) stop("Install the R package: ", package)
+}
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+categories <- c("OP_UNIQUE_CARRIER", "ORIGIN", "DEST", "day_of_week", "scheduled_departure_hour")
+trip_fields <- c("DISTANCE", "CRS_ELAPSED_TIME")
+history_fields <- c("origin_rate", "route_rate")
+targets <- c("major_delay_30", "major_delay_60")
+scenarios <- c(delay_30 = targets[1L], delay_60 = targets[2L], jfk_30 = targets[1L])
+if (options$scenario != "all") {
+  if (!options$scenario %in% names(scenarios)) stop("Unknown scenario.")
+  scenarios <- scenarios[options$scenario]
+}
+```
+
+## 2. Load flights and build historical rates
+
+The airport rate uses the origin's last eligible calendar day. The route rate uses the last 28 eligible calendar days, with a minimum of 20 flights. A sparse route falls back to the airport rate, then to the historical overall rate. Rows before any eligible history receive a zero placeholder. Set `history_lag: 2` for a two-day reporting delay. In the JFK experiment, the history source excludes all JFK-origin and JFK-destination flights.
+
+```{r history-functions}
+read_flights <- function(folder) {
+  if (.Platform$OS.type == "windows" && !l10n_info()[["UTF-8"]]) {
+    old_locale <- Sys.getlocale("LC_CTYPE")
+    on.exit(Sys.setlocale("LC_CTYPE", old_locale), add = TRUE)
+    Sys.setlocale("LC_CTYPE", ".UTF-8")
+  }
+  files <- sort(list.files(folder, "_cleaned\\.csv$", full.names = TRUE))
+  if (!length(files)) stop("No cleaned CSV files found in ", folder)
+  columns <- c(categories, trip_fields, targets, "month", "FL_DATE", "ARR_DELAY", "CANCELLED", "DIVERTED")
+  flights <- rbindlist(lapply(files, function(path) {
+    part <- fread(file = path, select = columns, colClasses = c(FL_DATE = "character"), encoding = "UTF-8")
+    if (!all(columns %in% names(part))) stop("Missing columns in ", basename(path))
+    part[, record_id := paste0(basename(path), ":", seq_len(.N) + 1L)]
+  }))
+  flights[, day := as.IDate(FL_DATE)]
+  stopifnot(!anyNA(flights), length(unique(format(flights$day, "%Y"))) == 1L,
+            setequal(flights$month, 1:12), all(flights$month == as.integer(format(flights$day, "%m"))),
+            all(flights$day_of_week == as.integer(format(flights$day, "%u")) - 1L),
+            all(is.finite(flights$ARR_DELAY)), all(is.finite(flights$DISTANCE)),
+            all(is.finite(flights$CRS_ELAPSED_TIME)), all(flights$CANCELLED == 0L), all(flights$DIVERTED == 0L),
+            all(flights$major_delay_30 == (flights$ARR_DELAY >= 30)),
+            all(flights$major_delay_60 == (flights$ARR_DELAY >= 60)))
+  flights[, c("ARR_DELAY", "CANCELLED", "DIVERTED") := NULL]
+  flights
+}
+
+daily_table <- function(reference, calendar, keys) {
+  daily <- reference[, .(n = .N, hits = sum(late)), by = c(keys, "day")]
+  grid <- unique(reference[, ..keys])[, .(day = calendar), by = keys]
+  grid[, `:=`(n = 0L, hits = 0L)]
+  grid[daily, on = c(keys, "day"), `:=`(n = i.n, hits = i.hits)]
+  setorderv(grid, c(keys, "day"))
+  grid
+}
+
+history_rates <- function(query, reference, target, lag) {
+  calendar <- seq(min(query$day), max(query$day), by = "day")
+  ref <- reference[, .(ORIGIN, DEST, day, late = get(target))]
+  global <- data.table(day = calendar, n = 0L, hits = 0L)
+  daily_global <- ref[, .(n = .N, hits = sum(late)), by = day]
+  global[daily_global, on = "day", `:=`(n = i.n, hits = i.hits)]
+  global[, rate := shift(cumsum(hits), lag, fill = 0) / shift(cumsum(n), lag, fill = 0)]
+  global_rate <- global[query, on = "day", x.rate]
+  global_rate[is.na(global_rate)] <- 0
+
+  airport <- daily_table(ref, calendar, "ORIGIN")
+  airport[, rate := shift(hits, lag) / shift(n, lag), by = ORIGIN]
+  origin_rate <- airport[query, on = c("ORIGIN", "day"), x.rate]
+  origin_rate[is.na(origin_rate)] <- global_rate[is.na(origin_rate)]
+
+  past_28 <- function(counts) {
+    total <- cumsum(counts)
+    shift(total, lag, fill = 0) - shift(total, lag + 28L, fill = 0)
+  }
+  routes <- daily_table(ref, calendar, c("ORIGIN", "DEST"))
+  routes[, `:=`(past_n = past_28(n), past_hits = past_28(hits)), by = .(ORIGIN, DEST)]
+  routes[, rate := fifelse(past_n >= 20L, past_hits / past_n, NA_real_)]
+  route_rate <- routes[query, on = c("ORIGIN", "DEST", "day"), x.rate]
+  route_rate[is.na(route_rate)] <- origin_rate[is.na(route_rate)]
+  data.table(origin_rate, route_rate)
+}
+
+prepare_splits <- function(flights, scenario, target, lag) {
+  jfk <- flights$ORIGIN == "JFK" | flights$DEST == "JFK"
+  if (scenario == "jfk_30") {
+    reference <- flights[!jfk]
+    eligible <- (!jfk & flights$month <= 9L) | (jfk & flights$month >= 10L)
+    query <- flights[eligible]
+  } else {
+    reference <- flights
+    query <- copy(flights)
+  }
+  query[, (history_fields) := history_rates(query, reference, target, lag)]
+  splits <- list(train = query[month <= 6L], validation = query[month %in% 7:8],
+                 calibration = query[month == 9L], test = query[month >= 10L])
+  audit <- rbindlist(lapply(names(splits), function(role) {
+    part <- splits[[role]]
+    stopifnot(setequal(part[[target]], 0:1))
+    data.table(scenario = scenario, split = role, flights = nrow(part), delays = sum(part[[target]]),
+               jfk_flights = sum(part$ORIGIN == "JFK" | part$DEST == "JFK"),
+               first_date = min(part$day), last_date = max(part$day))
+  }))
+  splits$audit <- audit
+  splits
+}
+```
+
+```{r prepare-data, class.source="fold-show"}
+flights <- read_flights(data_dir)
+prepared <- lapply(names(scenarios), function(name) {
+  prepare_splits(flights, name, scenarios[[name]], options$history_lag)
+})
+names(prepared) <- names(scenarios)
+split_table <- rbindlist(lapply(prepared, function(x) x$audit))
+fwrite(split_table, file.path(output_dir, "splits.csv"))
+print(split_table)
+rm(flights)
+```
+
+## 3. Compare random forests in July–August
+
+Weekday and hour are categorical. Destinations with fewer than 5,000 training flights are grouped into OTHER. The grid compares distance and duration separately, with and without historical rates, at two tree depths. Validation AP determines the winner, with Brier score breaking ties.
+
+```{r model-functions}
+fit_encoder <- function(train, numeric) {
+  destinations <- train[, .N, by = DEST][N >= 5000L, DEST]
+  levels <- lapply(categories, function(name) {
+    values <- train[[name]]
+    if (name == "DEST") values <- ifelse(values %in% destinations, values, "OTHER")
+    sort(unique(values))
+  })
+  names(levels) <- categories
+  list(destinations = destinations, levels = levels, numeric = numeric)
+}
+
+encode <- function(flights, encoder) {
+  n <- nrow(flights)
+  offsets <- c(0L, cumsum(lengths(encoder$levels)))
+  category_cols <- lapply(seq_along(categories), function(i) {
+    name <- categories[i]
+    values <- flights[[name]]
+    if (name == "DEST") values <- ifelse(values %in% encoder$destinations, values, "OTHER")
+    match(values, encoder$levels[[name]]) + offsets[i]
+  })
+  numeric_cols <- tail(offsets, 1L) + seq_along(encoder$numeric)
+  j <- c(unlist(category_cols), rep(numeric_cols, each = n))
+  i <- rep(seq_len(n), length(categories) + length(numeric_cols))
+  values <- c(rep(1, n * length(categories)), unlist(flights[, encoder$numeric, with = FALSE], use.names = FALSE))
+  known <- !is.na(j)
+  p <- max(numeric_cols)
+  Matrix::sparseMatrix(i = i[known], j = j[known], x = values[known],
+                       dims = c(n, p), dimnames = list(NULL, paste0("f", seq_len(p))))
+}
+
+evaluate <- function(actual, probability) {
+  order_by_risk <- order(probability, decreasing = TRUE, method = "radix")
+  end <- c(which(diff(probability[order_by_risk]) != 0), length(actual))
+  hits <- cumsum(actual[order_by_risk])[end]
+  precision <- hits / end
+  recall <- hits / sum(actual)
+  set.seed(42L)
+  count <- ceiling(length(actual) * 0.10)
+  top <- head(order(-probability, sample.int(length(actual)), method = "radix"), count)
+  positive <- actual == 1
+  positives <- as.double(sum(positive))
+  ranks <- rank(probability, ties.method = "average")
+  roc_auc <- (sum(ranks[positive]) - positives * (positives + 1) / 2) / (positives * sum(!positive))
+  metrics <- data.table(AP = sum(diff(c(0, recall)) * precision), ROC_AUC = roc_auc,
+                        Brier = mean((probability - actual)^2), Top10_precision = sum(actual[top]) / count,
+                        Top10_recall = sum(actual[top]) / positives, Top10_count = count, Top10_hits = sum(actual[top]))
+  list(metrics = metrics, selected = top, precision = c(1, precision), recall = c(0, recall))
+}
+
+tune <- function(splits, name, target, folder) {
+  dir.create(folder, recursive = TRUE, showWarnings = FALSE)
+  fwrite(splits$audit, file.path(folder, "splits.csv"))
+  results <- vector("list", 8L)
+  best <- NULL
+  candidate <- 0L
+  for (trip in trip_fields) {
+    for (use_history in c(FALSE, TRUE)) {
+      numeric <- c("month", trip, if (use_history) history_fields)
+      encoder <- fit_encoder(splits$train, numeric)
+      train_x <- encode(splits$train, encoder)
+      validation_x <- encode(splits$validation, encoder)
+      for (depth in c(8L, 12L)) {
+        candidate <- candidate + 1L
+        model <- ranger::ranger(x = train_x, y = factor(splits$train[[target]], levels = 0:1),
+                                probability = TRUE, num.trees = options$trees, max.depth = depth,
+                                min.node.size = 2L, min.bucket = 20L, oob.error = FALSE,
+                                num.threads = options$threads, seed = 42L, verbose = FALSE)
+        probability <- predict(model, data = validation_x, num.threads = options$threads)$predictions[, "1"]
+        metrics <- evaluate(splits$validation[[target]], probability)$metrics
+        row <- cbind(data.table(candidate = candidate, trip_feature = trip, history = use_history,
+                                max_depth = depth, n_estimators = options$trees), metrics)
+        results[[candidate]] <- row
+        if (is.null(best) || row$AP > best$row$AP || (row$AP == best$row$AP && row$Brier < best$row$Brier)) {
+          best <- list(row = row, model = model, encoder = encoder)
+        }
+        cat(sprintf("%s %d/8 | %s history=%s depth=%d | AP=%.5f\n", name, candidate, trip, use_history, depth, row$AP))
+        flush.console()
+        fwrite(rbindlist(results), file.path(folder, "validation.csv"))
+      }
+    }
+  }
+  fwrite(best$row, file.path(folder, "best_parameters.csv"))
+  best
+}
+```
+
+```{r tune-models, class.source="fold-show"}
+fitted <- lapply(names(scenarios), function(name) {
+  tune(prepared[[name]], name, scenarios[[name]], file.path(output_dir, name))
+})
+names(fitted) <- names(scenarios)
+print(rbindlist(lapply(fitted, function(x) x$row), idcol = "scenario"))
+```
+
+## 4. Calibrate the winner and fix the alert threshold in September
+
+Fit a monotone calibration map to September predictions. Sort September flights by risk and use the last score in the highest-risk 10% as the fixed alert cutoff. Ties at the cutoff are alerted together, so the alert share can exceed 10%. Top-10% evaluation is computed separately.
+
+```{r calibrate-models, class.source="fold-show"}
+calibrate <- function(fitted, september, target) {
+  raw <- predict(fitted$model, data = encode(september, fitted$encoder),
+                 num.threads = options$threads)$predictions[, "1"]
+  actual <- september[[target]]
+  ranked <- order(raw, -actual)
+  sorted <- raw[ranked]
+  risk <- stats::isoreg(sorted, actual[ranked])$yf
+  unique_scores <- !duplicated(sorted)
+  fitted$calibration <- data.table(raw = sorted[unique_scores], calibrated = risk[unique_scores])
+  fitted$threshold <- sort(risk, decreasing = TRUE)[ceiling(length(raw) * 0.10)]
+  fitted$september_alert_rate <- mean(risk >= fitted$threshold)
+  fitted
+}
+
+for (name in names(scenarios)) {
+  fitted[[name]] <- calibrate(fitted[[name]], prepared[[name]]$calibration, scenarios[[name]])
+  saveRDS(fitted[[name]], file.path(output_dir, name, "model.rds"))
+  cat(sprintf("%s | threshold %.6f | September alerts %.2f%%\n", name, fitted[[name]]$threshold,
+              100 * fitted[[name]]$september_alert_rate))
+}
+```
+
+## 5. Evaluate October–December and compare baselines
+
+The constant-risk baseline uses the January–June delay share. The training route baseline uses January–June route outcomes. The rolling route baseline uses only outcomes available before each forecast date. The RF is reported with both raw and calibrated probabilities.
+
+```{r test-functions}
+static_route_rate <- function(train, test, target) {
+  route <- train[, .(n = .N, risk = mean(get(target))), by = .(ORIGIN, DEST)][n >= 20L]
+  airport <- train[, .(risk = mean(get(target))), by = ORIGIN]
+  risk <- route[test, on = c("ORIGIN", "DEST"), x.risk]
+  origin <- airport[test, on = "ORIGIN", x.risk]
+  risk[is.na(risk)] <- origin[is.na(risk)]
+  risk[is.na(risk)] <- mean(train[[target]])
+  risk
+}
+
+plot_results <- function(folder, probability, actual, evaluations) {
+  colors <- seq_along(evaluations)
+  png(file.path(folder, "precision_recall.png"), width = 1050, height = 750, res = 150)
+  plot(c(0, 1), c(0, 1), type = "n", xlab = "Recall", ylab = "Precision", main = "October-December")
+  for (i in colors) lines(evaluations[[i]]$recall, evaluations[[i]]$precision, type = "S", col = colors[i])
+  legend("topright", names(probability), col = colors, lty = 1, bty = "n")
+  dev.off()
+  png(file.path(folder, "calibration.png"), width = 900, height = 900, res = 150)
+  plot(c(0, 1), c(0, 1), type = "n", xlab = "Mean predicted probability", ylab = "Observed delay rate")
+  abline(0, 1, lty = 2)
+  for (i in 1:2) {
+    p <- probability[[i]]
+    bins <- cut(p, breaks = seq(0, 1, by = 0.1), include.lowest = TRUE)
+    curve <- aggregate(cbind(predicted = p, observed = actual), list(bin = bins), mean)
+    lines(curve$predicted, curve$observed, type = "b", pch = 19, col = colors[i])
+  }
+  legend("topleft", names(probability)[1:2], col = colors[1:2], lty = 1, bty = "n")
+  dev.off()
+}
+
+test_model <- function(fitted, splits, name, target, folder) {
+  test <- splits$test
+  actual <- test[[target]]
+  raw <- predict(fitted$model, data = encode(test, fitted$encoder),
+                 num.threads = options$threads)$predictions[, "1"]
+  map <- fitted$calibration
+  calibrated <- if (nrow(map) == 1L) rep(map$calibrated, length(raw)) else {
+    approx(map$raw, map$calibrated, xout = raw, rule = 2)$y
+  }
+  methods <- list("RF raw" = raw, "RF calibrated" = calibrated,
+                  "Constant risk" = rep(mean(splits$train[[target]]), nrow(test)),
+                  "Training route rate" = static_route_rate(splits$train, test, target),
+                  "Rolling route rate" = test$route_rate)
+  evaluations <- lapply(methods, function(p) evaluate(actual, p))
+  comparison <- rbindlist(lapply(evaluations, function(x) x$metrics), idcol = "method")
+  comparison[, `:=`(scenario = name, target = target, flights = nrow(test), actual_delays = sum(actual))]
+  fixed <- calibrated >= fitted$threshold
+  threshold <- data.table(scenario = name, target = target, threshold = fitted$threshold,
+                          september_alert_rate = fitted$september_alert_rate, test_alert_rate = mean(fixed),
+                          test_alerts = sum(fixed), test_hits = sum(actual[fixed]),
+                          test_precision = if (any(fixed)) mean(actual[fixed]) else NA_real_,
+                          test_recall = sum(actual[fixed]) / sum(actual))
+  predictions <- test[, c("record_id", "FL_DATE", "ORIGIN", "DEST", target, "origin_rate"), with = FALSE]
+  for (method in names(methods)) {
+    column <- gsub(" ", "_", tolower(method), fixed = TRUE)
+    predictions[, (column) := methods[[method]]]
+  }
+  predictions[, in_top10_percent := seq_len(.N) %in% evaluations[["RF calibrated"]]$selected]
+  predictions[, above_fixed_threshold := fixed]
+  fwrite(comparison, file.path(folder, "evaluation.csv"))
+  fwrite(threshold, file.path(folder, "threshold.csv"))
+  fwrite(predictions, file.path(folder, "test_predictions.csv.gz"), compress = "gzip")
+  plot_results(folder, methods, actual, evaluations)
+  list(comparison = comparison, threshold = threshold)
+}
+```
+
+```{r test-models, class.source="fold-show"}
+results <- lapply(names(scenarios), function(name) {
+  test_model(fitted[[name]], prepared[[name]], name, scenarios[[name]], file.path(output_dir, name))
+})
+comparison <- rbindlist(lapply(results, function(x) x$comparison))
+thresholds <- rbindlist(lapply(results, function(x) x$threshold))
+fwrite(comparison, file.path(output_dir, "comparison.csv"))
+fwrite(thresholds, file.path(output_dir, "thresholds.csv"))
+```
+
+## 6. Results
+
+```{r scores}
+knitr::kable(comparison[, .(scenario, method, flights, actual_delays, AP, ROC_AUC, Brier,
+                            Top10_precision, Top10_recall)], digits = 4)
+knitr::kable(thresholds, digits = 4)
+```
+
+```{r plots, echo=FALSE, results="asis"}
+for (name in names(scenarios)) {
+  cat("\n\n### ", name, "\n\n", sep = "")
+  for (figure in c("precision_recall.png", "calibration.png")) {
+    path <- file.path(output_dir, name, figure)
+    if (knitting) {
+      cat(sprintf('<img src="%s" alt="%s" style="width:48%%" />\n', knitr::image_uri(path), figure))
+    } else {
+      cat(path, "\n")
+    }
+  }
+  cat("\n")
+}
+```
+
+Implementation references. [ranger probability forests](https://imbs-hl.github.io/ranger/reference/ranger.html) · [R isotonic regression](https://www.stat.ethz.ch/R-manual/R-devel/library/stats/help/isoreg.html)

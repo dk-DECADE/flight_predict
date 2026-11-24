@@ -1,0 +1,2 @@
+candidate,trip_feature,history,max_depth,n_estimators,AP,ROC_AUC,Brier,Top10_precision,Top10_recall,Top10_count,Top10_hits
+4,DISTANCE,TRUE,12,30,0.380296573096906,0.70319452328271,0.160232821944319,0.446943745098849,0.201548511976772,24229,10829
